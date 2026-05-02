@@ -11,6 +11,7 @@ import requests
 import os
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
+import httpx
 
 from api.context import router as context_router
 from api.tick import router as tick_router
@@ -34,7 +35,7 @@ def start_keep_alive():
         time.sleep(30)
         while True:
             try:
-                resp = requests.get(f"{bot_url}/v1/healthz", timeout=10)
+                resp = httpx.get(f"{bot_url}/v1/healthz", timeout=10)
                 print(f"[keep-alive] Pinged healthz — status {resp.status_code}")
             except Exception as e:
                 print(f"[keep-alive] Ping failed: {e}")
