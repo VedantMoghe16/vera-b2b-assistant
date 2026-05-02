@@ -1,10 +1,8 @@
 """
 api/tick.py — Periodic wake-up call from the judge.
-
-Evaluates available triggers and decides if an outbound message is warranted.
 """
 
-from typing import List
+from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
@@ -13,48 +11,63 @@ from compose import compose
 router = APIRouter()
 
 
+class TriggerObject(BaseModel):
+    trigger_id: str
+    type: str
+    merchant_id: str
+    signal: Optional[str] = None
+    customer_id: Optional[str] = None
+
+
 class TickBody(BaseModel):
-    now: str
-    available_triggers: List[str] = []
+    tick_id: Optional[str] = None
+    ts: Optional[str] = None
+    now: Optional[str] = None
+    available_triggers: List[str] = []          # judge sends trigger IDs
+    triggers: List[TriggerObject] = []          # judge sends full objects
 
 
 @router.post("/tick")
 async def tick(body: TickBody, request: Request):
-    """
-    Periodic wake-up call from the judge.
-    Evaluates available triggers and decides if an outbound message is warranted.
-    """
     contexts: dict = request.app.state.contexts
     conversations: dict = request.app.state.conversations
     actions = []
 
+    # Build a unified list of trigger payloads from BOTH formats
+    trigger_payloads = []
+
+    # Format 1: full trigger objects sent directly
+    for trg_obj in body.triggers:
+        trigger_payloads.append(trg_obj.dict())
+
+    # Format 2: trigger IDs — look up from stored context
     for trg_id in body.available_triggers:
         trg = contexts.get(("trigger", trg_id), {}).get("payload")
-        if not trg:
+        if trg:
+            trigger_payloads.append(trg)
+
+    for trg in trigger_payloads:
+        merchant_id = trg.get("merchant_id")
+        if not merchant_id:
             continue
 
-        # Hydrate the 4 contexts — safe access throughout
-        merchant_id = trg.get("merchant_id")
-        merchant = contexts.get(("merchant", merchant_id), {}).get("payload") if merchant_id else None
-
-        # Guard: merchant can be None if context hasn't been pushed yet
+        merchant = contexts.get(("merchant", merchant_id), {}).get("payload")
         if not merchant:
             continue
 
-        category_slug = merchant.get("category_slug")
+        category_slug = (
+            merchant.get("category_slug")
+            or merchant.get("identity", {}).get("category")
+        )
         category = contexts.get(("category", category_slug), {}).get("payload") if category_slug else None
 
         customer_id = trg.get("customer_id")
         customer = contexts.get(("customer", customer_id), {}).get("payload") if customer_id else None
 
-        if not category:
-            continue
-
-        # Run the composition engine (Selection -> Render -> LLM -> Validate -> Fallback)
+        # category can be None — compose should handle it gracefully
         action_payload = compose(category, merchant, trg, customer)
 
         if action_payload:
-            # Save the outgoing trigger context so the reply handler knows what we sent
             conv_id = action_payload["conversation_id"]
             conv_state = conversations.setdefault(conv_id, {
                 "turns": [],
@@ -64,7 +77,6 @@ async def tick(body: TickBody, request: Request):
             })
             conv_state["trigger_context"] = trg
             conv_state["last_outbound"] = action_payload
-
             actions.append(action_payload)
 
     return {"actions": actions}
