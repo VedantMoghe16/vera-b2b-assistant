@@ -1,0 +1,25 @@
+INFO:     Started server process [37266]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:57394 - "GET /v1/healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57396 - "GET /v1/metadata HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57398 - "POST /v1/context HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57400 - "POST /v1/context HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57402 - "POST /v1/context HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57404 - "POST /v1/context HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57406 - "POST /v1/context HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57408 - "POST /v1/context HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57410 - "POST /v1/context HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57412 - "POST /v1/context HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57414 - "POST /v1/context HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57416 - "POST /v1/context HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57418 - "GET /v1/healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57420 - "POST /v1/reply HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57422 - "POST /v1/reply HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57424 - "POST /v1/reply HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57426 - "POST /v1/reply HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57428 - "GET /v1/healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57430 - "POST /v1/reply HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57432 - "GET /v1/healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57434 - "POST /v1/reply HTTP/1.1" 200 OK
