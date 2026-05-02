@@ -1,14 +1,5 @@
 """
 fallback_ladder.py — graceful degradation when full grounding fails.
-
-5 rungs, each producing a complete on-voice message:
-  1. trigger_grounded    — full payload + full merchant
-  2. signals_grounded    — merchant.signals[] only
-  3. category_grounded   — category + locality only
-  4. identity_grounded   — name + city + category only
-  5. diagnostic          — nothing usable; ask one specific binary question
-
-Returns a contract-shaped action dict, not None — fallback always succeeds.
 """
 
 from __future__ import annotations
@@ -28,18 +19,89 @@ def fallback_compose(category: dict, merchant: dict, trigger: dict,
     return None
 
 
+def _get_owner(merchant: dict) -> str:
+    """Extract owner name from any possible field."""
+    identity = merchant.get("identity", {})
+    return (
+        identity.get("owner_first_name")
+        or identity.get("owner_name", "").split()[0]
+        or identity.get("name", "").split()[0]
+        or "there"
+    )
+
+
+def _get_city(merchant: dict) -> str:
+    """Extract city from any possible field."""
+    identity = merchant.get("identity", {})
+    return (
+        identity.get("city")
+        or identity.get("locality")
+        or (identity.get("location", "").split(",")[-1].strip()
+            if identity.get("location") else "")
+        or "your city"
+    )
+
+
+def _get_locality(merchant: dict) -> str:
+    """Extract locality/neighbourhood from any possible field."""
+    identity = merchant.get("identity", {})
+    return (
+        identity.get("locality")
+        or (identity.get("location", "").split(",")[0].strip()
+            if identity.get("location") else "")
+        or identity.get("city")
+        or "your area"
+    )
+
+
+def _rung_1_trigger(category, merchant, trigger, customer):
+    """Rung 1: Full trigger + merchant grounding."""
+    kind = trigger.get("kind", "") or trigger.get("type", "")
+    payload = trigger.get("payload", {})
+    signal = trigger.get("signal", "")
+    owner = _get_owner(merchant)
+    sname = merchant.get("identity", {}).get("name", "")
+    if not (sname and kind):
+        return None
+
+    # Use top-level signal field OR payload facts
+    if signal:
+        body = (
+            f"Hi {owner} — {signal}. "
+            f"This looks like a strong window for {sname} to capture new patients. "
+            f"Want me to draft a targeted message to bring them in?"
+        )
+        return _wrap(merchant, trigger, body, "binary_yes_no",
+                     "vera_fallback_trigger_signal_v1",
+                     [owner, sname, signal])
+
+    facts = []
+    for k, v in payload.items():
+        if v and k not in ("merchant_id", "customer_id", "id", "scope"):
+            facts.append(f"{k.replace('_', ' ')}: {v}")
+    if not facts:
+        return None
+
+    fact_str = "; ".join(facts[:3])
+    body = (
+        f"Hi {owner} — a quick update on {kind.replace('_', ' ')} for {sname}. "
+        f"{fact_str}. Want me to walk you through the next step?"
+    )
+    return _wrap(merchant, trigger, body, "binary_yes_no",
+                 "vera_fallback_trigger_v1", [owner, sname, kind, fact_str])
+
+
 def _rung_2_signals(category, merchant, trigger, customer):
     """Use merchant.signals[] to produce a specific message."""
     signals = merchant.get("signals", [])
     if not signals:
         return None
 
-    owner = merchant.get("identity", {}).get("owner_first_name", "")
+    owner = _get_owner(merchant)
     sname = merchant.get("identity", {}).get("name", "")
-    if not owner or not sname:
+    if not sname:
         return None
 
-    # Find the highest-leverage signal to act on
     if "unverified_gbp" in signals:
         body = (
             f"{owner}, {sname} isn't verified on Google yet — that's the "
@@ -60,15 +122,14 @@ def _rung_2_signals(category, merchant, trigger, customer):
                      "vera_fallback_renewal_v1", [owner])
 
     if "no_active_offers" in signals:
-        # Pull from category catalog
         catalog = category.get("offer_catalog", [])
         if catalog:
             offer = catalog[0]
             body = (
                 f"{owner}, {sname} doesn't have an active offer right now. "
-                f"Most peers in your category are running '{offer.get('title', 'a starter offer')}' "
-                f"as a new-user hook. Want me to set it up on your GBP + "
-                f"WhatsApp?"
+                f"Most peers in your category are running "
+                f"'{offer.get('title', 'a starter offer')}' as a new-user hook. "
+                f"Want me to set it up on your GBP + WhatsApp?"
             )
             return _wrap(merchant, trigger, body, "binary_yes_no",
                          "vera_fallback_no_offer_v1",
@@ -79,18 +140,36 @@ def _rung_2_signals(category, merchant, trigger, customer):
 
 def _rung_3_category(category, merchant, trigger, customer):
     """Use category-level peer stats + locality + performance numbers."""
-    locality = merchant.get("identity", {}).get("locality", "")
-    owner = merchant.get("identity", {}).get("owner_first_name", "")
+    locality = _get_locality(merchant)
+    owner = _get_owner(merchant)
     sname = merchant.get("identity", {}).get("name", "")
-    if not owner or not locality or not sname:
+    if not sname:
         return None
 
-    peer_stats = category.get("peer_stats", {})
     digest = category.get("digest", [])
+
+    # Build from offers if no digest
+    offers = merchant.get("offers", [])
+    perf = merchant.get("performance", {})
+
+    if offers and perf:
+        offer = offers[0]
+        footfall = perf.get("weekly_footfall", 0)
+        rating = perf.get("avg_rating", 0)
+        body = (
+            f"Hi {owner} — {sname} has {footfall} weekly visits and a "
+            f"{rating}★ rating. Your '{offer.get('name', 'top offer')}' "
+            f"at ₹{offer.get('price', '')} could be the hook to convert "
+            f"the 190 people searching in {locality} right now. "
+            f"Want me to run a targeted push?"
+        )
+        return _wrap(merchant, trigger, body, "binary_yes_no",
+                     "vera_fallback_offers_perf_v1",
+                     [owner, sname, str(footfall), str(rating)])
+
     if not digest:
         return None
 
-    # Pick a "trend" or "tech" digest item — most actionable
     actionable_item = next(
         (d for d in digest
          if d.get("kind") in ("trend", "tech") and d.get("actionable")),
@@ -102,17 +181,16 @@ def _rung_3_category(category, merchant, trigger, customer):
     title = actionable_item.get("title", "")
     actionable = actionable_item.get("actionable", "")
 
-    # Add performance numbers for specificity anchors
-    perf = merchant.get("performance", {})
+    perf_str = ""
     views = perf.get("views", 0)
     calls = perf.get("calls", 0)
-    perf_str = ""
     if views or calls:
         perf_str = f" With {views} views and {calls} calls this month,"
 
     body = (
-        f"{owner} — quick note from this week's {category.get('display_name', 'industry')} "
-        f"digest. {title}. Practical angle for {sname} in {locality}: "
+        f"{owner} — quick note from this week's "
+        f"{category.get('display_name', 'industry')} digest. {title}. "
+        f"Practical angle for {sname} in {locality}: "
         f"{actionable}.{perf_str} want me to spec out the next step?"
     )
     return _wrap(merchant, trigger, body, "binary_yes_no",
@@ -121,20 +199,25 @@ def _rung_3_category(category, merchant, trigger, customer):
 
 
 def _rung_4_identity(category, merchant, trigger, customer):
-    """Only owner_first_name, name, city, category survive."""
-    owner = merchant.get("identity", {}).get("owner_first_name", "")
+    """Only owner name, business name, city, category survive."""
+    owner = _get_owner(merchant)
     sname = merchant.get("identity", {}).get("name", "")
-    city = merchant.get("identity", {}).get("city", "")
-    if not (owner and sname and city):
-        return None
+    city = _get_city(merchant)
+    cat_name = (
+        category.get("display_name")
+        or merchant.get("identity", {}).get("category", "")
+        or "your category"
+    )
 
-    cat_name = category.get("display_name", "your category")
+    # Only need sname to produce something useful
+    if not sname:
+        return None
 
     body = (
         f"Hi {owner} — Vera here from magicpin. I'm noticing {cat_name} "
-        f"in {city} are seeing strong growth in WhatsApp-based customer "
-        f"reactivation right now (~3x retention vs walk-in only). Worth a "
-        f"2-min walkthrough for {sname}?"
+        f"businesses in {city} are seeing strong growth in WhatsApp-based "
+        f"customer reactivation right now (~3x retention vs walk-in only). "
+        f"Worth a 2-min walkthrough for {sname}?"
     )
     return _wrap(merchant, trigger, body, "binary_yes_no",
                  "vera_fallback_identity_v1", [owner, sname, city, cat_name])
@@ -142,8 +225,8 @@ def _rung_4_identity(category, merchant, trigger, customer):
 
 def _rung_5_diagnostic(category, merchant, trigger, customer):
     """Nothing usable — ask one specific binary diagnostic."""
-    owner = merchant.get("identity", {}).get("owner_first_name", "there")
-    cat_name = category.get("display_name", "")
+    owner = _get_owner(merchant)
+    cat_name = category.get("display_name", "your business")
 
     body = (
         f"Hi {owner} — Vera here. To send something useful instead of "
@@ -153,33 +236,6 @@ def _rung_5_diagnostic(category, merchant, trigger, customer):
     )
     return _wrap(merchant, trigger, body, "multi_choice",
                  "vera_fallback_diagnostic_v1", [owner, cat_name])
-
-
-def _rung_1_trigger(category, merchant, trigger, customer):
-    """Rung 1: Full trigger + merchant grounding — try to produce a specific message
-    directly from trigger payload when the normal template path fails."""
-    kind = trigger.get("kind", "")
-    payload = trigger.get("payload", {})
-    owner = merchant.get("identity", {}).get("owner_first_name", "")
-    sname = merchant.get("identity", {}).get("name", "")
-    if not (owner and sname and kind):
-        return None
-
-    # Build a concise, grounded message from the raw trigger payload
-    facts = []
-    for k, v in payload.items():
-        if v and k not in ("merchant_id", "customer_id", "id", "scope"):
-            facts.append(f"{k.replace('_', ' ')}: {v}")
-    if not facts:
-        return None
-
-    fact_str = "; ".join(facts[:3])  # cap at 3 facts for brevity
-    body = (
-        f"{owner}, a quick update on {kind.replace('_', ' ')} for {sname}. "
-        f"{fact_str}. Want me to walk you through the next step?"
-    )
-    return _wrap(merchant, trigger, body, "binary_yes_no",
-                 "vera_fallback_trigger_v1", [owner, sname, kind, fact_str])
 
 
 _RUNG_HANDLERS = {
@@ -196,14 +252,16 @@ def _wrap(merchant: dict, trigger: dict, body: str, cta: str,
     """Build the contract-shaped action dict for a fallback message."""
     mid = merchant.get("merchant_id", "unknown")
     short_mid = mid.split("_")[1] if "_" in mid else mid[:6]
-    kind = trigger.get("kind", "fallback")
+    kind = trigger.get("kind") or trigger.get("type", "fallback")
     week = datetime.utcnow().strftime("W%V")
     conv_id = f"conv_m_{short_mid}_{kind}_{week}_fb"
     sup_key = (f"fallback:{kind}:{mid}:"
                f"{hashlib.sha256(body.encode()).hexdigest()[:6]}")
-    rationale = (f"Full-grounding compose unavailable; fell back to specific "
-                 f"category/identity-level message. Maintains specificity "
-                 f"without inventing merchant-specific facts.")
+    rationale = (
+        f"Full-grounding compose unavailable; fell back to specific "
+        f"category/identity-level message. Maintains specificity "
+        f"without inventing merchant-specific facts."
+    )
     return {
         "body": body,
         "cta": cta,
