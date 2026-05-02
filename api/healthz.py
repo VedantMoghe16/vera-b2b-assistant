@@ -3,7 +3,7 @@ from fastapi import APIRouter, Request
 
 router = APIRouter()
 
-@router.get("/healthz")
+@router.api_route("/healthz", methods=["GET", "HEAD"])
 async def healthz(request: Request):
     """
     Liveness probe. The judge polls this every 60s.
