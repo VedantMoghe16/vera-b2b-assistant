@@ -1,0 +1,11 @@
+{
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "databricks"
+  ],
+  "permissions": {
+    "allow": [
+      "Bash(python3 *)"
+    ]
+  }
+}

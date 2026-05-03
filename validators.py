@@ -63,11 +63,9 @@ def _no_taboo_vocab(body: str, category: dict) -> bool:
     taboo = category.get("voice", {}).get("vocab_taboo", [])
     body_lower = body.lower()
     for t in taboo:
-        # Word-boundary match
-        t_clean = t.lower().split("(")[0].strip()  # strip parenthetical
+        t_clean = t.lower().split("(")[0].strip()
         if not t_clean:
             continue
-        # Allow 5+ char taboos to use loose matching; short ones strict
         pattern = rf"\b{re.escape(t_clean)}\b"
         if re.search(pattern, body_lower):
             return False
@@ -81,33 +79,70 @@ def _claims_traceable(body: str, trigger: dict, merchant: dict,
     simple arithmetic (e.g., tier pricing: 149 - 24 = 125 is valid).
     """
     nums_in_body = [int(n) for n in re.findall(r"\d+", body)
-                    if len(n) <= 6]  # cap to avoid huge nums
+                    if len(n) <= 6]
 
-    # Build legitimate number pool — ONLY from grounded data fields,
-    # not from metadata like trigger IDs, scopes, or internal keys.
+    # Build legitimate number pool — ONLY from grounded data fields.
     legitimate = set()
-    # Trigger payload (the actual data, not the envelope)
-    trigger_payload = trigger.get("payload", {})
-    legitimate.update(int(n) for n in re.findall(r"\d+", str(trigger_payload)) if len(n) <= 6)
-    # Merchant performance data
-    legitimate.update(int(n) for n in re.findall(r"\d+", str(merchant.get("performance", {}))) if len(n) <= 6)
-    # Merchant identity (for things like years_in_business, etc.)
-    legitimate.update(int(n) for n in re.findall(r"\d+", str(merchant.get("identity", {}))) if len(n) <= 6)
-    # Merchant offers
-    legitimate.update(int(n) for n in re.findall(r"\d+", str(merchant.get("offers", []))) if len(n) <= 6)
-    # Merchant signals (some contain numeric thresholds)
-    legitimate.update(int(n) for n in re.findall(r"\d+", str(merchant.get("signals", []))) if len(n) <= 6)
-    # Category voice (for operational numbers like "15-min check-up")
-    legitimate.update(int(n) for n in re.findall(r"\d+", str(category.get("voice", {}))) if len(n) <= 6)
-    legitimate.update(int(n) for n in re.findall(r"\d+", str(category.get("peer_stats", {}))) if len(n) <= 6)
-    legitimate.update(int(n) for n in re.findall(r"\d+", str(category.get("digest", []))) if len(n) <= 6)
-    legitimate.update(int(n) for n in re.findall(r"\d+", str(category.get("offer_catalog", []))) if len(n) <= 6)
-    legitimate.update(int(n) for n in re.findall(r"\d+", str(category.get("seasonal_beats", []))) if len(n) <= 6)
-    if customer:
-        legitimate.update(int(n) for n in re.findall(r"\d+", str(customer)) if len(n) <= 6)
 
-    # Safe numbers: small ints (anything ≤30) and common formatting numerics
-    SAFE_THRESHOLD = 30  # small numbers like word counts, tier-counts, days
+    # Trigger payload (the actual data)
+    trigger_payload = trigger.get("payload", {})
+    legitimate.update(
+        int(n) for n in re.findall(r"\d+", str(trigger_payload)) if len(n) <= 6
+    )
+    # Trigger top-level signal field (e.g., "190 people searched...")
+    signal_text = trigger.get("signal", "") or ""
+    legitimate.update(
+        int(n) for n in re.findall(r"\d+", signal_text) if len(n) <= 6
+    )
+    # Trigger top-level numeric fields (urgency, etc.)
+    for field_name in ("urgency",):
+        val = trigger.get(field_name)
+        if isinstance(val, (int, float)):
+            legitimate.add(int(val))
+
+    # Merchant performance data
+    legitimate.update(
+        int(n) for n in re.findall(r"\d+", str(merchant.get("performance", {}))) if len(n) <= 6
+    )
+    # Merchant identity
+    legitimate.update(
+        int(n) for n in re.findall(r"\d+", str(merchant.get("identity", {}))) if len(n) <= 6
+    )
+    # Merchant offers (prices, IDs)
+    legitimate.update(
+        int(n) for n in re.findall(r"\d+", str(merchant.get("offers", []))) if len(n) <= 6
+    )
+    # Merchant signals
+    legitimate.update(
+        int(n) for n in re.findall(r"\d+", str(merchant.get("signals", []))) if len(n) <= 6
+    )
+    # Merchant customer_aggregate
+    legitimate.update(
+        int(n) for n in re.findall(r"\d+", str(merchant.get("customer_aggregate", {}))) if len(n) <= 6
+    )
+    # Category voice (operational numbers like "15-min check-up")
+    legitimate.update(
+        int(n) for n in re.findall(r"\d+", str(category.get("voice", {}))) if len(n) <= 6
+    )
+    legitimate.update(
+        int(n) for n in re.findall(r"\d+", str(category.get("peer_stats", {}))) if len(n) <= 6
+    )
+    legitimate.update(
+        int(n) for n in re.findall(r"\d+", str(category.get("digest", []))) if len(n) <= 6
+    )
+    legitimate.update(
+        int(n) for n in re.findall(r"\d+", str(category.get("offer_catalog", []))) if len(n) <= 6
+    )
+    legitimate.update(
+        int(n) for n in re.findall(r"\d+", str(category.get("seasonal_beats", []))) if len(n) <= 6
+    )
+    if customer:
+        legitimate.update(
+            int(n) for n in re.findall(r"\d+", str(customer)) if len(n) <= 6
+        )
+
+    # Small numbers and common formatting numerics are always safe
+    SAFE_THRESHOLD = 30
 
     suspicious = []
     for n in nums_in_body:
@@ -115,38 +150,26 @@ def _claims_traceable(body: str, trigger: dict, merchant: dict,
             continue
         if n in legitimate:
             continue
-        # Derived-by-arithmetic check: is this n = a±b or a±c for some a,b,c
-        # in the legitimate pool? Covers tier pricing (125 = 149-24).
         if _is_derivable(n, legitimate):
             continue
         suspicious.append(n)
 
-    # Allow up to 2 unmatched (operational tolerance for minor compositional math)
+    # Allow up to 2 unmatched (tolerance for minor compositional math)
     return len(suspicious) <= 2
 
 
 def _is_derivable(target: int, pool: set) -> bool:
-    """
-    Check if target can be derived as a±b for some a,b in pool, or as
-    a percentage/multiple of a pool value.
-    """
+    """Check if target = a±b for some a,b in pool, or a percentage multiple."""
     pool_list = list(pool)
     for a in pool_list:
         for b in pool_list:
             if a + b == target:  return True
             if a - b == target:  return True
             if b - a == target:  return True
-    # Percentage derivation: 38% of 2100 = 798 isn't useful, but
-    # multiples of round numbers (e.g., 105 = 149 - 44, or 245 from members count)
-    # are caught by the additive check above.
     return False
 
 
 def _length_reasonable(body: str) -> bool:
-    """
-    Per case studies, 50/50 outputs can be 8+ lines long when delivering an
-    artifact (corporate thali). Cap is generous: <= 600 chars or <= 12 sentences.
-    """
     if len(body) > 1500:
         return False
     sentences = re.split(r"[.!?]+\s+", body.strip())
@@ -155,8 +178,5 @@ def _length_reasonable(body: str) -> bool:
 
 
 def _no_repeated_question(body: str) -> bool:
-    """
-    No more than 2 question marks. The case studies have at most one; we
-    allow 2 because a tier-list followup may legitimately have a clarifier.
-    """
+    """No more than 2 question marks."""
     return body.count("?") <= 2

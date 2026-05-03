@@ -4,34 +4,80 @@ templates/registry.py — Vera's category × trigger-kind template matrix.
 Each template is a render function that takes (category, merchant, trigger,
 customer, enriched) and returns a fully-composed message dict, OR None if
 required slots can't be grounded.
-
-Templates are calibrated against the 10 case studies in case-studies.md.
-The patterns judges score 9-10 on:
-  - Source citations (JIDA, DCI, batch numbers)
-  - Numbers traceable to context fields
-  - Owner first name in salutation
-  - Single low-friction CTA
-  - Hindi-English code-mix where appropriate
-  - Domain vocabulary (covers, AOV, sub-potency, fluoride, etc.)
-
-This file is intentionally PARAPHRASE of case-study shapes — never a copy.
-The plagiarism check would penalize duplicates.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Callable, Optional
+
+
+# ─── Category voice mini-map (for template-level vocabulary) ─────────────────
+
+_CAT_VOICE = {
+    "dentist":    {"patient_word": "patients", "service_word": "consultation"},
+    "dentists":   {"patient_word": "patients", "service_word": "consultation"},
+    "salon":      {"patient_word": "clients",  "service_word": "appointment"},
+    "salons":     {"patient_word": "clients",  "service_word": "appointment"},
+    "restaurant": {"patient_word": "customers","service_word": "visit"},
+    "restaurants":{"patient_word": "customers","service_word": "visit"},
+    "gym":        {"patient_word": "members",  "service_word": "session"},
+    "gyms":       {"patient_word": "members",  "service_word": "session"},
+    "pharmacy":   {"patient_word": "patients", "service_word": "prescription"},
+    "pharmacies": {"patient_word": "patients", "service_word": "prescription"},
+}
+
+def _cat_voice(slug: str) -> dict:
+    return _CAT_VOICE.get(slug, {"patient_word": "customers", "service_word": "service"})
 
 
 # ─── Public API ─────────────────────────────────────────────────────────────
 
 TemplateFn = Callable[[dict, dict, dict, Optional[dict], dict], Optional[dict]]
 
+# Kind aliases — judge sends these short names, map to canonical kinds
+_KIND_ALIASES = {
+    "recall":    "recall_due",
+    "lapse":     "customer_lapsed_hard",
+    "festival":  "festival_upcoming",
+    "perf_dip":  "perf_dip",   # already in registry as _all_
+}
+
 
 def get_template(kind: str, category_slug: str) -> Optional[TemplateFn]:
-    """Return the template function for (kind, category) or None."""
-    return _REGISTRY.get((kind, category_slug)) or _REGISTRY.get((kind, "_all_"))
+    """Return the template function for (kind, category) or None.
+
+    Tries in order:
+      1. Exact (kind, category_slug)
+      2. Exact (kind, "_all_")
+      3. Alias resolution then same two lookups
+      4. Plural/singular normalization then same two lookups
+    """
+    if not kind:
+        return None
+
+    # Direct lookups
+    fn = _REGISTRY.get((kind, category_slug)) or _REGISTRY.get((kind, "_all_"))
+    if fn:
+        return fn
+
+    # Alias resolution
+    canonical = _KIND_ALIASES.get(kind)
+    if canonical and canonical != kind:
+        fn = _REGISTRY.get((canonical, category_slug)) or _REGISTRY.get((canonical, "_all_"))
+        if fn:
+            return fn
+
+    # Normalize plural ↔ singular for category slug
+    if category_slug:
+        alt_slug = (category_slug[:-1] if category_slug.endswith("s")
+                    else category_slug + "s")
+        fn = _REGISTRY.get((kind, alt_slug)) or _REGISTRY.get((canonical or kind, alt_slug))
+        if fn:
+            return fn
+
+    return None
 
 
 def render_template(template: TemplateFn, category: dict, merchant: dict,
@@ -57,18 +103,31 @@ def _owner_name(merchant: dict, prefix: str = "") -> str:
 
 def _customer_name(customer: dict) -> str:
     raw = customer.get("identity", {}).get("name", "")
-    # Handle "Aanya (parent: Sneha)" → "Aanya"
     return raw.split("(")[0].strip()
 
 
 def _get_offer(merchant: dict, predicate: Callable[[dict], bool] = None,
                status: str = "active") -> Optional[dict]:
+    """Get first offer matching predicate. If status-filtered finds nothing, try any offer."""
+    candidates = []
     for o in merchant.get("offers", []):
-        if o.get("status") != status:
+        if o.get("status") is not None and o.get("status") != status:
             continue
+        if predicate is None or predicate(o):
+            candidates.append(o)
+    if candidates:
+        return candidates[0]
+    # Fallback: any offer regardless of status
+    for o in merchant.get("offers", []):
         if predicate is None or predicate(o):
             return o
     return None
+
+
+def _get_any_offer(merchant: dict) -> Optional[dict]:
+    """Get first available offer regardless of status."""
+    offers = merchant.get("offers", [])
+    return offers[0] if offers else None
 
 
 def _category_offer(category: dict, offer_id: str) -> Optional[dict]:
@@ -101,13 +160,12 @@ def _t_research_digest__dentists(category, merchant, trigger, customer, enriched
     cohort_count = (merchant.get("customer_aggregate", {})
                     .get("high_risk_adult_count"))
     if not cohort_count:
-        return None  # need merchant-specific anchor for top score
+        return None
 
     owner = _owner_name(merchant, "Dr.")
     source = _safe(digest.get("source"), "JIDA")
     trial_n = digest.get("trial_n")
     summary = _safe(digest.get("summary"), "")
-    # Extract effect size from summary
     pct = _extract_first_pct(summary) or "significant reduction in"
 
     body = (
@@ -135,16 +193,17 @@ def _t_recall_due__dentists(category, merchant, trigger, customer, enriched):
     if len(slots) < 2:
         return None
 
-    # Honor language pref
     lang = customer.get("identity", {}).get("language_pref", "en")
     is_hi_en = "hi" in lang
 
-    # Find a cleaning-relevant offer
     offer = _get_offer(merchant,
-                       lambda o: "cleaning" in o.get("title", "").lower())
+                       lambda o: "cleaning" in o.get("title", "").lower() or
+                                 "check" in o.get("name", "").lower())
     price_str = ""
-    if offer and "299" in offer.get("title", ""):
-        price_str = "₹299 cleaning"
+    if offer:
+        price = offer.get("price", offer.get("price", ""))
+        if price:
+            price_str = f"₹{price} cleaning"
 
     months = _months_since(customer.get("relationship", {}).get("last_visit"))
     s1, s2 = slots[0]["label"], slots[1]["label"]
@@ -188,10 +247,11 @@ def _t_competitor_opened__dentists(category, merchant, trigger, customer, enrich
     locality = merchant.get("identity", {}).get("locality", "your area")
 
     own_offer = _get_offer(merchant,
-                           lambda o: "cleaning" in o.get("title", "").lower())
+                           lambda o: "cleaning" in o.get("title", "").lower() or
+                                     "check" in o.get("name", "").lower())
     counter = ""
     if own_offer:
-        counter = f"You're at {own_offer['title']} — close on price"
+        counter = f"You're at {own_offer.get('title', own_offer.get('name', ''))} — close on price"
 
     body = (
         f"{owner}, heads up — {competitor} opened {distance}km away in "
@@ -206,6 +266,67 @@ def _t_competitor_opened__dentists(category, merchant, trigger, customer, enrich
         "cta": "binary_yes_no",
         "template_name": "vera_competitor_dentists_v1",
         "template_params": [owner, competitor, str(distance), their_offer, locality],
+    }
+
+
+# == RESEARCH SPIKE (all categories) =========================================
+
+def _t_research_spike__all(category, merchant, trigger, customer, enriched):
+    """Outbound demand spike — count from signal, map to best offer, single yes/no."""
+    signal = trigger.get("signal", "")
+    payload = trigger.get("payload", {})
+
+    # Extract search count: signal text first, then payload fields
+    count = None
+    if signal:
+        m = re.search(r'(\d+)', signal)
+        if m:
+            count = m.group(1)
+    if not count:
+        raw = payload.get("search_count") or payload.get("count") or payload.get("volume")
+        if raw:
+            count = str(raw)
+
+    if not count:
+        return None
+
+    identity = merchant.get("identity", {})
+    locality = (identity.get("locality") or
+                (identity.get("location", "").split(",")[0].strip()
+                 if identity.get("location") else "") or
+                identity.get("city", ""))
+
+    cat_slug = category.get("slug", "")
+    voice = _cat_voice(cat_slug)
+    patient_word = voice["patient_word"]
+    service_word = voice["service_word"]
+
+    locality_str = locality or "your locality"
+
+    # Best offer — prefer one with "active" status or any if status unset
+    offer = _get_any_offer(merchant)
+
+    if offer:
+        offer_name = offer.get("name", "")
+        offer_price = offer.get("price", "")
+        body = (
+            f"{count} {patient_word} in {locality_str} are searching for "
+            f"a {offer_name}. Should I reach them with your "
+            f"₹{offer_price} {service_word} offer?"
+        )
+        params = [count, patient_word, locality_str, offer_name, str(offer_price)]
+    else:
+        body = (
+            f"{count} {patient_word} in {locality_str} are actively searching for "
+            f"services like yours right now. Should I help you reach them?"
+        )
+        params = [count, patient_word, locality_str]
+
+    return {
+        "body": body,
+        "cta": "binary_yes_no",
+        "template_name": "vera_research_spike_v1",
+        "template_params": params,
     }
 
 
@@ -253,7 +374,7 @@ def _t_curious_ask_due__salons(category, merchant, trigger, customer, enriched):
         f"Hi {owner}! Quick check — what service has been most asked about "
         f"this week at {sname}{loc_str}? With {views} profile views this month, "
         f"I'll turn the answer into a Google post plus a 4-line WhatsApp reply "
-        f"you can reuse when customers ask about pricing. Should take 5 minutes."
+        f"you can reuse when clients ask about pricing. Should take 5 minutes."
     )
     return {
         "body": body,
@@ -305,14 +426,12 @@ def _t_ipl_match_today__restaurants(category, merchant, trigger, customer, enric
         return None
     time_str = _format_match_time(match_time)
 
-    # Find existing offer
     bogo = _get_offer(merchant,
                       lambda o: "bogo" in o.get("title", "").lower() or
                                 "buy 1" in o.get("title", "").lower())
 
     loc_str = f" in {locality}" if locality else ""
     if not is_weeknight:
-        # Saturday IPL — counter-intuitive advice from category digest
         body = (
             f"Quick heads-up {owner} — {match} at {venue} tonight, {time_str}. "
             f"Important: Saturday IPL matches typically shift -12% restaurant "
@@ -320,13 +439,12 @@ def _t_ipl_match_today__restaurants(category, merchant, trigger, customer, enric
             f"instead push your "
         )
         if bogo:
-            body += f"{bogo['title']} (already active) "
+            body += f"{bogo.get('title', bogo.get('name', 'BOGO offer'))} (already active) "
         else:
             body += "BOGO pizza "
         body += (f"as a delivery-only Saturday special. Want me to draft the "
                  f"Swiggy banner + an Insta story? Live in 10 min.")
     else:
-        # Weeknight match — push aggressively
         body = (
             f"{owner}, {match} at {venue} tonight, {time_str} — weeknight IPL "
             f"is your strongest bracket (+18% covers vs Saturday avg). For {sname}{loc_str}, want "
@@ -355,12 +473,12 @@ def _t_active_planning_intent__restaurants(category, merchant, trigger, customer
     sname = merchant.get("identity", {}).get("name", "")
 
     if "corp" in topic.lower() or "thali" in topic.lower():
-        # Use the actual offer
         thali_offer = _get_offer(merchant,
-                                 lambda o: "thali" in o.get("title", "").lower())
-        retail_price = 149  # default
+                                 lambda o: "thali" in o.get("title", "").lower() or
+                                           "thali" in o.get("name", "").lower())
+        retail_price = 149
         if thali_offer:
-            for token in thali_offer.get("title", "").split():
+            for token in (thali_offer.get("title", "") or thali_offer.get("name", "")).split():
                 if token.startswith("₹"):
                     try:
                         retail_price = int(token[1:].replace(",", ""))
@@ -384,7 +502,6 @@ def _t_active_planning_intent__restaurants(category, merchant, trigger, customer
             "template_params": [owner, sname, locality, str(retail_price)],
         }
 
-    # Generic planning followup
     body = (
         f"{owner}, picking up on '{topic}'. To make this concrete, I need "
         f"one input: what's your current avg order value at {sname}? "
@@ -481,7 +598,6 @@ def _t_customer_lapsed_hard__gyms(category, merchant, trigger, customer, enriche
     owner = merchant.get("identity", {}).get("owner_first_name", "")
     sname = merchant.get("identity", {}).get("name", "the gym")
 
-    # Match focus to a class
     class_pitch = "an evening HIIT class (45 min, 6:30pm Tue/Thu)"
     if "weight_loss" in focus:
         class_pitch = ("a Tue/Thu evening HIIT class (45 min, 6:30pm) — "
@@ -558,15 +674,15 @@ def _t_supply_alert__pharmacies(category, merchant, trigger, customer, enriched)
 
     chronic_count = (merchant.get("customer_aggregate", {})
                      .get("chronic_rx_count", 0))
-    affected_estimate = max(1, chronic_count // 11)  # ~9% on this molecule
+    affected_estimate = max(1, chronic_count // 11)
     batches_str = ", ".join(batches[:2])
 
     body = (
         f"{owner}, urgent: voluntary recall on {len(batches)} {molecule} "
         f"batches ({batches_str}) by {manufacturer} — sub-potency, no "
-        f"safety risk, but customers should be informed for replacement. "
+        f"safety risk, but patients should be informed for replacement. "
         f"Pulled your repeat-Rx list: ~{affected_estimate} of your "
-        f"{chronic_count} chronic-Rx customers were dispensed these batches "
+        f"{chronic_count} chronic-Rx patients were dispensed these batches "
         f"in the last 90 days. Want me to draft their WhatsApp note + the "
         f"replacement-pickup workflow?"
     )
@@ -671,7 +787,7 @@ def _t_gbp_unverified__pharmacies(category, merchant, trigger, customer, enriche
     }
 
 
-# == ALL CATEGORIES (generic fallbacks) ======================================
+# == ALL CATEGORIES (generic) ================================================
 
 def _t_perf_dip__all(category, merchant, trigger, customer, enriched):
     payload = trigger.get("payload", {})
@@ -736,7 +852,6 @@ def _t_renewal_due__all(category, merchant, trigger, customer, enriched):
     if not owner:
         return None
 
-    # Tie renewal to performance signal so it doesn't read as transactional
     perf = merchant.get("performance", {})
     delta_calls = perf.get("delta_7d", {}).get("calls_pct", 0)
 
@@ -780,10 +895,7 @@ def _t_active_planning_intent__all(category, merchant, trigger, customer, enrich
     }
 
 
-# == NEW DEDICATED TEMPLATES (replaces fallthrough to generic) ==============
-
 def _t_regulation_change__all(category, merchant, trigger, customer, enriched):
-    """Compliance deadlines — high-stakes, must cite source authority."""
     payload = trigger.get("payload", {})
     rule_id = payload.get("rule_id", "")
     deadline = payload.get("deadline_iso", "")
@@ -796,17 +908,18 @@ def _t_regulation_change__all(category, merchant, trigger, customer, enriched):
     if not owner:
         return None
 
-    # Days to deadline
     try:
         from datetime import datetime as dt
         dl = dt.fromisoformat(deadline.replace("Z", "+00:00"))
         days_left = max(0, (dl - dt.now(dl.tzinfo)).days)
     except Exception:
         days_left = 30
+        dl = None
 
+    deadline_str = dl.strftime("%-d %b %Y") if dl else deadline
     body = (
         f"{owner}, compliance flag — {authority or 'regulator'} circular "
-        f"{rule_id}: {summary}. Deadline {dl.strftime('%-d %b %Y') if days_left else deadline} "
+        f"{rule_id}: {summary}. Deadline {deadline_str} "
         f"({days_left} days left). I can pull a 1-page checklist of what "
         f"to verify in your records before the date — should I send it?"
     )
@@ -819,7 +932,6 @@ def _t_regulation_change__all(category, merchant, trigger, customer, enriched):
 
 
 def _t_festival_upcoming__all(category, merchant, trigger, customer, enriched):
-    """Festival calendar — match category-specific angle."""
     payload = trigger.get("payload", {})
     festival = payload.get("festival", "")
     days_to = payload.get("days_until", payload.get("days_to_festival", 0))
@@ -836,10 +948,15 @@ def _t_festival_upcoming__all(category, merchant, trigger, customer, enriched):
     cat_slug = category.get("slug", "")
     angle_by_category = {
         "salons":      f"booking pre-{festival} hair + skin appointments now — salons in {locality} typically see 35% more bookings 2 weeks before",
+        "salon":       f"booking pre-{festival} hair + skin appointments now — salons in {locality} typically see 35% more bookings 2 weeks before",
         "restaurants": f"a sweets-and-thali combo for {festival} family orders — restaurants in {locality} see 40% more delivery orders during festival week",
+        "restaurant":  f"a sweets-and-thali combo for {festival} family orders — restaurants in {locality} see 40% more delivery orders during festival week",
         "dentists":    f"pre-{festival} cleaning slots so smiles look sharp in photos — 3-week window is ideal",
+        "dentist":     f"pre-{festival} cleaning slots so smiles look sharp in photos — 3-week window is ideal",
         "gyms":        f"a 7-day '{festival} prep' challenge for members — gyms in {locality} see 20% more sign-ups with festival hooks",
+        "gym":         f"a 7-day '{festival} prep' challenge for members — gyms in {locality} see 20% more sign-ups with festival hooks",
         "pharmacies":  f"stock check on diabetic-friendly sweets and antacids ahead of {festival} — pharmacies in {locality} typically see 25% uptick",
+        "pharmacy":    f"stock check on diabetic-friendly sweets and antacids ahead of {festival} — pharmacies in {locality} typically see 25% uptick",
     }
     angle = angle_by_category.get(cat_slug, f"a {festival}-themed promotion for {locality}")
 
@@ -857,7 +974,6 @@ def _t_festival_upcoming__all(category, merchant, trigger, customer, enriched):
 
 
 def _t_milestone_reached__all(category, merchant, trigger, customer, enriched):
-    """Milestone celebrations — short, warm, leverage social proof."""
     payload = trigger.get("payload", {})
     milestone = payload.get("milestone", "")
     value = payload.get("value", "")
@@ -887,7 +1003,6 @@ def _t_milestone_reached__all(category, merchant, trigger, customer, enriched):
 
 
 def _t_trial_followup__all(category, merchant, trigger, customer, enriched):
-    """Trial→conversion follow-up — customer-scope."""
     if not customer:
         return None
     payload = trigger.get("payload", {})
@@ -903,8 +1018,11 @@ def _t_trial_followup__all(category, merchant, trigger, customer, enriched):
 
     program_pitch = program or {
         "salons": "the 4-session skin-prep package",
+        "salon": "the 4-session skin-prep package",
         "gyms": "the 8-week starter program",
-        "dentists": "ongoing cleaning + checkup",
+        "gym": "the 8-week starter program",
+        "dentists": "ongoing cleaning + check-up",
+        "dentist": "ongoing cleaning + check-up",
     }.get(cat_slug, "the full program")
 
     body = (
@@ -923,7 +1041,6 @@ def _t_trial_followup__all(category, merchant, trigger, customer, enriched):
 
 
 def _t_perf_spike__all(category, merchant, trigger, customer, enriched):
-    """Positive perf spike — validate the win, suggest a way to compound it."""
     payload = trigger.get("payload", {})
     metric = payload.get("metric", "views")
     delta = payload.get("delta_pct", 0)
@@ -963,7 +1080,6 @@ def _t_perf_spike__all(category, merchant, trigger, customer, enriched):
 
 
 def _t_winback_eligible__all(category, merchant, trigger, customer, enriched):
-    """Winback at merchant scope — about reactivating a customer cohort."""
     payload = trigger.get("payload", {})
     cohort_size = payload.get("eligible_count", 0)
     last_active_days = payload.get("avg_last_active_days", 0)
@@ -973,11 +1089,15 @@ def _t_winback_eligible__all(category, merchant, trigger, customer, enriched):
     if not owner or not cohort_size:
         return None
 
+    cat_slug = category.get("slug", "")
+    voice = _cat_voice(cat_slug)
+    patient_word = voice["patient_word"]
+
     body = (
-        f"{owner}, ~{cohort_size} customers haven't been back to {sname} in "
+        f"{owner}, ~{cohort_size} {patient_word} haven't been back to {sname} in "
         f"{last_active_days}+ days. Industry baseline for a warm-tone "
         f"winback message is 8-12% reactivation. Want me to draft a "
-        f"single WhatsApp template you can personalize per customer + send "
+        f"single WhatsApp template you can personalize per {patient_word[:-1] if patient_word.endswith('s') else patient_word} + send "
         f"in batches of 25/day?"
     )
     return {
@@ -989,7 +1109,6 @@ def _t_winback_eligible__all(category, merchant, trigger, customer, enriched):
 
 
 def _t_dormant_with_vera__all(category, merchant, trigger, customer, enriched):
-    """Dormant Vera-side — re-engage merchant gently with a value-first probe."""
     payload = trigger.get("payload", {})
     days_dormant = (payload.get("days_since_last_merchant_message") or
                     payload.get("days_since_last_engagement") or 30)
@@ -1001,7 +1120,6 @@ def _t_dormant_with_vera__all(category, merchant, trigger, customer, enriched):
     if not owner:
         return None
 
-    # Pull concrete performance data for specificity
     perf = merchant.get("performance", {})
     views = perf.get("views", 0)
     calls = perf.get("calls", 0)
@@ -1013,7 +1131,6 @@ def _t_dormant_with_vera__all(category, merchant, trigger, customer, enriched):
         topic_anchor = f" Last we spoke about {topic_clean}."
 
     loc_str = f" in {locality}" if locality else ""
-    # Build a data-grounded reactivation message instead of a vague probe
     body = (
         f"Hi {owner} — Vera here. About {days_dormant} days since we last "
         f"connected.{topic_anchor} Quick update on {sname}{loc_str}: "
@@ -1035,7 +1152,6 @@ def _t_dormant_with_vera__all(category, merchant, trigger, customer, enriched):
 
 
 def _t_cde_opportunity__dentists(category, merchant, trigger, customer, enriched):
-    """CDE / continuing education for dental professionals."""
     payload = trigger.get("payload", {})
     program = payload.get("program_name", "")
     credits = payload.get("credit_hours", 0)
@@ -1062,7 +1178,6 @@ def _t_cde_opportunity__dentists(category, merchant, trigger, customer, enriched
 
 
 def _t_category_seasonal__all(category, merchant, trigger, customer, enriched):
-    """Category-wide seasonal beat (heatwave, monsoon, exam stress)."""
     payload = trigger.get("payload", {})
     beat = payload.get("seasonal_beat", "")
     advisory = payload.get("advisory", "")
@@ -1077,10 +1192,15 @@ def _t_category_seasonal__all(category, merchant, trigger, customer, enriched):
     cat_slug = category.get("slug", "")
     angle = {
         "pharmacies":  "ORS sachets, sunscreen, hydration salts",
+        "pharmacy":    "ORS sachets, sunscreen, hydration salts",
         "restaurants": "lighter menu — buttermilk, salads, cooling specials",
+        "restaurant":  "lighter menu — buttermilk, salads, cooling specials",
         "salons":      "scalp/skin treatments for heat damage",
+        "salon":       "scalp/skin treatments for heat damage",
         "gyms":        "shift outdoor classes earlier; hydration protocol",
+        "gym":         "shift outdoor classes earlier; hydration protocol",
         "dentists":    "post-mango-season cleaning push",
+        "dentist":     "post-mango-season cleaning push",
     }.get(cat_slug, "category-appropriate prep")
 
     body = (
@@ -1122,13 +1242,12 @@ def _format_match_time(iso: str) -> str:
 def _format_date(iso: str) -> str:
     try:
         d = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return d.strftime("%-d %b")  # e.g., "28 Apr"
+        return d.strftime("%-d %b")
     except Exception:
         return iso
 
 
 def _extract_first_pct(text: str) -> Optional[str]:
-    import re
     m = re.search(r"(\d+(?:\.\d+)?%)", text)
     return m.group(1) if m else None
 
@@ -1136,10 +1255,11 @@ def _extract_first_pct(text: str) -> Optional[str]:
 # ─── Registry ───────────────────────────────────────────────────────────────
 
 _REGISTRY: dict[tuple[str, str], TemplateFn] = {
-    # Dentists
+    # Dentists (singular and plural slug both covered via get_template normalization)
     ("research_digest",       "dentists"):    _t_research_digest__dentists,
     ("recall_due",            "dentists"):    _t_recall_due__dentists,
     ("competitor_opened",     "dentists"):    _t_competitor_opened__dentists,
+    ("cde_opportunity",       "dentists"):    _t_cde_opportunity__dentists,
 
     # Salons
     ("wedding_package_followup", "salons"):   _t_wedding_package_followup__salons,
@@ -1161,7 +1281,8 @@ _REGISTRY: dict[tuple[str, str], TemplateFn] = {
     ("chronic_refill_due",       "pharmacies"):_t_chronic_refill_due__pharmacies,
     ("gbp_unverified",           "pharmacies"):_t_gbp_unverified__pharmacies,
 
-    # Generic fallbacks (any category)
+    # Generic (any category)
+    ("research_spike",           "_all_"):    _t_research_spike__all,
     ("perf_dip",                 "_all_"):    _t_perf_dip__all,
     ("renewal_due",              "_all_"):    _t_renewal_due__all,
     ("active_planning_intent",   "_all_"):    _t_active_planning_intent__all,
@@ -1173,7 +1294,4 @@ _REGISTRY: dict[tuple[str, str], TemplateFn] = {
     ("winback_eligible",         "_all_"):    _t_winback_eligible__all,
     ("dormant_with_vera",        "_all_"):    _t_dormant_with_vera__all,
     ("category_seasonal",        "_all_"):    _t_category_seasonal__all,
-
-    # Category-specific specialty
-    ("cde_opportunity",          "dentists"): _t_cde_opportunity__dentists,
 }

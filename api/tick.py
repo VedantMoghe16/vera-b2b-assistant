@@ -2,6 +2,7 @@
 api/tick.py — Periodic wake-up call from the judge.
 """
 
+from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
@@ -32,6 +33,12 @@ class TickBody(BaseModel):
 async def tick(body: TickBody, request: Request):
     contexts: dict = request.app.state.contexts
     conversations: dict = request.app.state.conversations
+
+    # Initialize suppressions set if not present (belt-and-suspenders)
+    if not hasattr(request.app.state, "suppressions"):
+        request.app.state.suppressions = set()
+    suppressions: set = request.app.state.suppressions
+
     actions = []
 
     print(f"[tick] available_triggers={body.available_triggers}")
@@ -49,6 +56,8 @@ async def tick(body: TickBody, request: Request):
             trigger_payloads.append(trg)
 
     print(f"[tick] trigger_payloads={trigger_payloads}")
+
+    week = datetime.utcnow().strftime("%G-W%V")
 
     for trg in trigger_payloads:
         merchant_id = trg.get("merchant_id")
@@ -77,9 +86,16 @@ async def tick(body: TickBody, request: Request):
         customer_id = trg.get("customer_id")
         customer = contexts.get(("customer", customer_id), {}).get("payload") if customer_id else None
 
+        # ─── Suppression pre-check ────────────────────────────────────────────
+        kind = trg.get("kind") or trg.get("type", "unknown")
+        pre_key = f"{kind}:{merchant_id}:{week}"
+        if pre_key in suppressions:
+            print(f"[tick] SUPPRESSED (same week): {pre_key}")
+            continue
+
         print(f"[tick] calling compose...")
         try:
-            action_payload = compose(category, merchant, trg, customer)
+            action_payload = compose(category or {}, merchant, trg, customer)
             print(f"[tick] compose result={action_payload}")
         except Exception as e:
             print(f"[tick] compose EXCEPTION: {e}")
@@ -88,6 +104,16 @@ async def tick(body: TickBody, request: Request):
             continue
 
         if action_payload:
+            # ─── Suppression post-check and registration ──────────────────────
+            sup_key = action_payload.get("suppression_key", "")
+            if sup_key and sup_key in suppressions:
+                print(f"[tick] SUPPRESSED (exact key): {sup_key}")
+                continue
+            # Register both the full key and the simple week key
+            if sup_key:
+                suppressions.add(sup_key)
+            suppressions.add(pre_key)
+
             conv_id = action_payload["conversation_id"]
             conv_state = conversations.setdefault(conv_id, {
                 "turns": [],
