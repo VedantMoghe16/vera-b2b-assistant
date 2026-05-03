@@ -211,7 +211,7 @@ def _handle_decline(merchant, customer, category, trigger,
     if alt:
         body = (
             f"Understood{' ' + owner if owner else ''} — won't push on this. "
-            f"One quick alternative: {alt}. "
+            f"One quick alternative: {alt.rstrip('.')}. "
             f"Otherwise, I'll check back with something different in a few days."
         )
         return _send(

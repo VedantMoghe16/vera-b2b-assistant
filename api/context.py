@@ -1,11 +1,14 @@
 """
 api/context.py — Receives incremental context pushes from the judge.
 
-Must be idempotent and respect versioning.
+Must be idempotent and respect versioning:
+  same version  → no-op (accepted: false, stale_version)
+  lower version → no-op (accepted: false, stale_version)
+  higher version → replace stored payload
 """
 
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
@@ -17,23 +20,21 @@ class ContextBody(BaseModel):
     context_id: str
     version: int
     payload: Dict[str, Any]
-    delivered_at: str
+    delivered_at: Optional[str] = None  # judge may omit; not required internally
 
 
 @router.post("/context")
 async def push_context(body: ContextBody, request: Request):
     """
     Receives incremental context pushes from the judge.
-    Must be idempotent and respect versioning.
+    Scopes: merchant, category, customer, trigger.
     """
-    # CRITICAL: access the shared dict initialized in server.py lifespan
-    # This is a mutable dict stored on app.state — mutations are visible globally.
     contexts: dict = request.app.state.contexts
 
     key = (body.scope, body.context_id)
     cur = contexts.get(key)
 
-    # Idempotency and version collision check
+    # Idempotency: reject same or older versions
     if cur and cur["version"] >= body.version:
         return {
             "accepted": False,
@@ -41,7 +42,6 @@ async def push_context(body: ContextBody, request: Request):
             "current_version": cur["version"],
         }
 
-    # Atomically replace/store the payload (in-place mutation of the shared dict)
     contexts[key] = {
         "version": body.version,
         "payload": body.payload,
